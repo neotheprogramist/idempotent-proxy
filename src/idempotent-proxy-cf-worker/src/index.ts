@@ -16,6 +16,7 @@ const HEADER_X_FORWARDED_HOST = 'x-forwarded-host'
 const HEADER_IDEMPOTENCY_KEY = 'idempotency-key'
 const HEADER_X_JSON_MASK = 'x-json-mask'
 const HEADER_RESPONSE_HEADERS = 'response-headers'
+const CHUNK_SIZE = 96 * 1024 // 96 KiB
 
 export interface Env {
   POLL_INTERVAL: number // in milliseconds
@@ -23,6 +24,92 @@ export interface Env {
   ALLOW_AGENTS: string[]
   MY_DURABLE_OBJECT: DurableObjectNamespace
   CACHER: DurableObjectNamespace<Cacher>
+}
+
+function numberTo32BitUint8Array(num: number): Uint8Array {
+  let buffer = new ArrayBuffer(4)
+  let view = new DataView(buffer)
+  view.setUint32(0, num, true)
+  return new Uint8Array(buffer)
+}
+
+function numberFrom32BitUint8Array(uint8Array: Uint8Array): number {
+  let buffer = uint8Array.buffer
+  let view = new DataView(buffer)
+  return view.getUint32(0, true)
+}
+
+async function chunkAndStore(
+  env: Env,
+  originalHeaders: string,
+  data: ArrayBuffer,
+  jsonMask: string,
+  responseHeaders: Headers,
+  responseStatus: number,
+  parentId: DurableObjectId
+) {
+  // Split the response data into chunks
+  const chunks = []
+  for (let i = 0; i < data.byteLength; i += CHUNK_SIZE) {
+    chunks.push(data.slice(i, i + CHUNK_SIZE))
+  }
+
+  // Store chunks under parentKey with chunkId
+  for (const [chunkId, chunk] of chunks.entries()) {
+    const chunkStorageKey = env.CACHER.idFromName(`${parentId}:${chunkId}`)
+    const chunkStub = env.CACHER.get(chunkStorageKey)
+
+    const rd = new ResponseData(responseStatus)
+      .setHeaders(responseHeaders, originalHeaders)
+      .setBody(new Uint8Array(chunk), jsonMask)
+
+    await chunkStub.set(rd.toBytes())
+  }
+
+  return chunks.length
+}
+
+const readRequestFromStore = async (
+  jsonMask: string,
+  env: Env,
+  stub: DurableObjectStub<Cacher>,
+  parentId: DurableObjectId
+) => {
+  const lock = await stub.obtain()
+
+  if (!lock) {
+    const data = await polling_get(
+      stub,
+      env.POLL_INTERVAL,
+      Math.floor(env.REQUEST_TIMEOUT / env.POLL_INTERVAL)
+    )
+    const chunkCount = numberFrom32BitUint8Array(data)
+    let fullData = new Uint8Array()
+    let responseData = new ResponseData()
+
+    for (const chunkId of [...Array(chunkCount).keys()]) {
+      const chunkStorageKey = env.CACHER.idFromName(`${parentId}:${chunkId}`)
+      const chunkStub = env.CACHER.get(chunkStorageKey)
+
+      const data = await polling_get(
+        chunkStub,
+        env.POLL_INTERVAL,
+        Math.floor(env.REQUEST_TIMEOUT / env.POLL_INTERVAL)
+      )
+
+      responseData = ResponseData.fromBytes(data)
+
+      if (!responseData.body) {
+        return null
+      }
+
+      fullData = new Uint8Array([...fullData, ...responseData.body])
+    }
+
+    return responseData.setBody(fullData, jsonMask)
+  } else {
+    return null
+  }
 }
 
 // Worker
@@ -76,19 +163,16 @@ export default {
       })
     }
 
+    const jsonMask = req.headers.get(HEADER_X_JSON_MASK) || ''
+    const originalHeaders = req.headers.get(HEADER_RESPONSE_HEADERS) || ''
     const id = env.CACHER.idFromName(`${agent}:${req.method}:${idempotencyKey}`)
     const stub = env.CACHER.get(id)
 
     try {
-      const lock = await stub.obtain()
-      if (!lock) {
-        const data = await polling_get(
-          stub,
-          env.POLL_INTERVAL,
-          Math.floor(env.REQUEST_TIMEOUT / env.POLL_INTERVAL)
-        )
-        const rd = ResponseData.fromBytes(data)
-        return rd.toResponse()
+      const cachedResponse = await readRequestFromStore(jsonMask, env, stub, id)
+
+      if (cachedResponse) {
+        return cachedResponse.toResponse()
       }
 
       const res = await fetch(url, {
@@ -99,17 +183,26 @@ export default {
 
       if (res.status >= 200 && res.status <= 500) {
         const data = await res.arrayBuffer()
-        const rd = new ResponseData(res.status)
-          .setHeaders(
-            new Headers(res.headers),
-            req.headers.get(HEADER_RESPONSE_HEADERS) || ''
-          )
-          .setBody(
-            new Uint8Array(data),
-            req.headers.get(HEADER_X_JSON_MASK) || ''
-          )
-        await stub.set(rd.toBytes())
-        return rd.toResponse()
+        const responseHeaders = new Headers(res.headers)
+
+        // store chunks
+        const chunksLength = await chunkAndStore(
+          env,
+          originalHeaders,
+          data,
+          jsonMask,
+          responseHeaders,
+          res.status,
+          id
+        )
+
+        // store chunksLength
+        await stub.set(numberTo32BitUint8Array(chunksLength))
+
+        return new ResponseData(res.status)
+          .setHeaders(responseHeaders, originalHeaders)
+          .setBody(new Uint8Array(data), jsonMask)
+          .toResponse()
       }
 
       stub.del()
